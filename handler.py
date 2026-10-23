@@ -3,6 +3,7 @@ import base64
 import io
 import os
 import threading
+import time
 import traceback
 
 import numpy as np
@@ -14,6 +15,9 @@ from transformers import pipeline
 
 MODEL_ID = os.getenv("MODEL_ID", "mmeog/mme_stt_model")
 MODEL_REVISION = os.getenv("MODEL_REVISION", "")
+
+# Set to 0 to disable chunking. Benchmark before enabling.
+CHUNK_LENGTH_S = int(os.getenv("CHUNK_LENGTH_S", "0"))
 
 _asr = None
 _model_lock = threading.Lock()
@@ -40,9 +44,21 @@ def load_model():
         if MODEL_REVISION:
             kwargs["revision"] = MODEL_REVISION
 
-        _asr = pipeline(
-            "automatic-speech-recognition",
-            **kwargs,
+        if CHUNK_LENGTH_S > 0:
+            kwargs["chunk_length_s"] = CHUNK_LENGTH_S
+
+        print(
+            f"[STT] Loading model={MODEL_ID}, "
+            f"device={'cuda:0' if use_cuda else 'cpu'}, "
+            f"chunk_length_s={CHUNK_LENGTH_S}",
+            flush=True,
+        )
+
+        t0 = time.perf_counter()
+        _asr = pipeline("automatic-speech-recognition", **kwargs)
+        print(
+            f"[STT] Model load: {time.perf_counter() - t0:.3f}s",
+            flush=True,
         )
 
     return _asr
@@ -61,6 +77,11 @@ def handler(job):
             "model": MODEL_ID,
             "loaded": _asr is not None,
             "cuda_available": torch.cuda.is_available(),
+            "gpu": (
+                torch.cuda.get_device_name(0)
+                if torch.cuda.is_available()
+                else None
+            ),
         }
 
     if task != "stt":
@@ -70,9 +91,11 @@ def handler(job):
     if not audio_b64:
         raise ValueError("Provide audio_b64 containing a WAV file")
 
-    try:
-        audio_bytes = base64.b64decode(audio_b64, validate=True)
+    total_start = time.perf_counter()
 
+    try:
+        t0 = time.perf_counter()
+        audio_bytes = base64.b64decode(audio_b64, validate=True)
         audio, sample_rate = sf.read(
             io.BytesIO(audio_bytes),
             dtype="float32",
@@ -86,27 +109,54 @@ def handler(job):
 
         if sample_rate != 16000:
             audio = resample_poly(
-                audio,
-                16000,
-                sample_rate,
+                audio, 16000, sample_rate
             ).astype(np.float32)
             sample_rate = 16000
 
-        audio = np.asarray(audio, dtype=np.float32)
+        audio = np.ascontiguousarray(audio, dtype=np.float32)
+        preprocess_s = time.perf_counter() - t0
 
+        t0 = time.perf_counter()
         asr = load_model()
+        load_or_retrieve_s = time.perf_counter() - t0
+
+        # Ensure GPU execution time is measured accurately.
+        if torch.cuda.is_available():
+            torch.cuda.synchronize()
+
+        t0 = time.perf_counter()
         result = asr({
             "raw": audio,
             "sampling_rate": sample_rate,
         })
 
+        if torch.cuda.is_available():
+            torch.cuda.synchronize()
+
+        inference_s = time.perf_counter() - t0
+
+        text = result["text"].strip()
+        total_s = time.perf_counter() - total_start
+
+        print(
+            f"[STT_TIMING] "
+            f"audio_s={len(audio) / sample_rate:.2f} "
+            f"preprocess_s={preprocess_s:.3f} "
+            f"load_or_retrieve_s={load_or_retrieve_s:.3f} "
+            f"inference_s={inference_s:.3f} "
+            f"total_s={total_s:.3f} "
+            f"cuda={torch.cuda.is_available()} "
+            f"text_chars={len(text)}",
+            flush=True,
+        )
+
         return {
-            "text": result["text"].strip(),
+            "text": text,
             "model": MODEL_ID,
         }
 
     except Exception as exc:
-        print(f"STT inference error: {exc}")
+        print(f"STT inference error: {exc}", flush=True)
         traceback.print_exc()
         raise
 
