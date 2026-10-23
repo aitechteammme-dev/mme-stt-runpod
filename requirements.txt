@@ -1,6 +1,6 @@
 
 runpod
-transformers>=4.46,<5
+transformers>=5.0,<6
 accelerate
 safetensors
 soundfile
