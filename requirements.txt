@@ -1,8 +1,8 @@
 
 runpod
-transformers
+transformers>=4.46,<5
 accelerate
 safetensors
-huggingface_hub
 soundfile
-librosa
+numpy
+scipy
